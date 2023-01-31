@@ -181,8 +181,7 @@ unsatZoneEvap <- function(unsatStorage, potentialEvap, wetFrac){
 The function for equation 14, the flux of overland flow, $Q_o(S_c, S_{uz})$, is:
 
 ```{r}
-overlandFlow <- function(canopyThroughfall, canopyDrainage, satFrac){
-  precipExcess <- canopyThroughfall + canopyDrainage
+overlandFlow <- function(precipExcess, satFrac){
   overlandFlowOut <- precipExcess*satFrac
 }
 ```
@@ -198,7 +197,7 @@ percolation <- function(unsatStorage){
   else {
     percolationOut <- maxPerc * ((unsatStorage-fieldCapacity)/(unsatMaxStorage-fieldCapacity))^nonLinearityPerc
   }
-  return(unsatZoneEvapOut)
+  return(percolationOut)
 }
 ```
 
@@ -212,7 +211,7 @@ satFrac <- function(unsatStorage){
   else {
     satFracOut <- 1
   }
-  return(unsatZoneEvapOut)
+  return(satFracOut)
 }
 ```
 
@@ -249,10 +248,11 @@ canopy_df$canopy_drainage <- mapply(canopyDrainage, precip_inc, canopy_df$canopy
 
 ```{r}
 #| label: "fig-q-2"
-#| layout-ncol: 2
-#| fig-width: 4
-#| fig-height: 4
+#| layout-ncol: 3
+#| fig-width: 3
+#| fig-height: 3
 #| fig-subcap: 
+#| - " "
 #| - " "
 #| - " "
 #| fig-cap: Diagnostic variables used in the flux calculations
@@ -275,3 +275,311 @@ ggplot(canopy_df, aes(canopy_storage, canopy_drainage)) +
   ylab('Canopy Drainage (mm/day)') +
   theme_bw()
 ```
+
+# Solve Individual ODEs
+
+## Write a function to compute the RHS of the ODEs
+
+Write a function for the RHS of equation 1 & 4, the change in canopy storage over time:
+
+$$
+\frac{dS_c}{dt} = P - E_c(S_c) - Q_t(S_c) - Q_c(S_c)
+$$
+
+```{r}
+delCanopyStorage <- function(precipInc, canopyEvap, canopyThroughfall, canopyDrainage){
+  delCanopyStorageOut <- precipInc - canopyEvap - canopyThroughfall - canopyDrainage
+  
+  return(delCanopyStorageOut)
+}
+```
+
+Write a function for the RHS of equation 2 & 5, the change in storage in the unsaturated zone over time:
+
+$$
+\frac{dS_{uz}}{dt} = P_e(S_c) - E_c(S_c,S_{uz}) - Q_o(S_c, S_{uz}) - Q_p(S_{uz})
+$$
+
+```{r}
+# precipExcess is the effective precipitation flux, canopy throughfall plus canopy drainage (mm day)
+
+delUnsatStorage <- function(precipExcess, unsatZoneEvap, overlandFlow, percolation){
+  delUnsatStorageOut <- precipExcess - unsatZoneEvap - overlandFlow - percolation
+  
+  return(delUnsatStorageOut)
+}
+```
+
+Write a function for the RHS of equation 3 & 6, the change in the saturated zone over time:
+
+$$
+\frac{dS_{uz}}{dt} = Q_p(S_{uz}) - Q_b(S_{uz})
+$$
+
+```{r}
+delSatStorage <- function(percolation, baseflow){
+  delSatStorageOut <- percolation - baseflow
+  
+  return(delSatStorageOut)
+}
+```
+
+## Define the forcing for the below examples 
+
+Example Forcing
+
+```{r}
+daily_df <- data.frame(
+  datetime = seq(as.POSIXct('2023-01-01'), as.POSIXct('2023-01-10'), by = 'day'),
+  ppt = 100, # The precipitation flux: P = 100 mm day−1
+  ppe = 100, # The effective precipitation flux: Pe = 100 mm day−1 .
+  pet = 5, # The potential ET flux: Ep = 5 mm day−1
+  wet_frac = NA,
+  canopy_evap = NA,
+  canopy_throughfall = NA,
+  canopy_drainage = NA
+  )
+
+hourly_df <- data.frame(
+  datetime = seq(as.POSIXct('2023-01-01'), as.POSIXct('2023-01-11'), by = 'hour'),
+  ppt = 100, # The precipitation flux: P = 100 mm day−1
+  ppe = 100, # The effective precipitation flux: Pe = 100 mm day−1 .
+  pet = 5, # The potential ET flux: Ep = 5 mm day−1
+  wet_frac = NA,
+  canopy_evap = NA,
+  canopy_throughfall = NA,
+  canopy_drainage = NA
+  )
+
+five_min_df <- data.frame(
+  datetime = seq(as.POSIXct('2023-01-01'), as.POSIXct('2023-01-11'), by = '5 min'),
+  ppt = 100, # The precipitation flux: P = 100 mm day−1
+  ppe = 100, # The effective precipitation flux: Pe = 100 mm day−1 .
+  pet = 5, # The potential ET flux: Ep = 5 mm day−1
+  wet_frac = NA,
+  canopy_evap = NA,
+  canopy_throughfall = NA,
+  canopy_drainage = NA
+  )
+
+```
+
+Set initial canopy storage to zero
+
+```{r}
+daily_df$canopy_storage <- c(0, rep(NA, nrow(daily_df)-1))
+
+daily_df
+
+hourly_df$canopy_storage <- c(0, rep(NA, nrow(hourly_df)-1))
+
+head(hourly_df)
+
+five_min_df$canopy_storage <- c(0, rep(NA, nrow(five_min_df)-1))
+
+head(five_min_df)
+```
+
+## Temporally Integrate eq 4
+
+Define a explicit euler based function to step through our various time series and calculat the change in canopy storage.
+
+```{r}
+runCanopyStorageEuler <- function(df, delTime){
+  for (i in 1:(nrow(df)-1)) {
+  df$wet_frac[i] <- 
+    wetFrac(canopyInterception = df$canopy_storage[i])
+  
+  df$canopy_evap[i] <- 
+    interceptEvap(potentialEvap = df$pet[i], 
+                  wetFrac = df$wet_frac[i])   
+  
+  df$canopy_throughfall[i] <- 
+    canopyThroughfall(precipInc = df$ppt[i], 
+                      canopyInterception = df$canopy_storage[i])
+  
+  df$canopy_drainage[i] <- 
+    canopyDrainage(precipInc = df$ppt[i], 
+                   canopyInterception = df$canopy_storage[i]) 
+  
+   del_canopy_storage <- delCanopyStorage(df$ppt[i],
+                                          df$canopy_evap[i],
+                                          df$canopy_throughfall[i],
+                                          df$canopy_drainage[i]
+                                          ) * delTime
+   
+  df$canopy_storage[i+1] <- max(c(df$canopy_storage[i] + del_canopy_storage, 0))
+  }
+  return(df)
+}
+```
+
+Run for our daily set
+
+```{r}
+delTime <- 1 # day
+
+daily_df <- runCanopyStorageEuler(daily_df, delTime)
+```
+
+Run for hourly
+
+```{r}
+delTime <- 1/24 # (day)
+
+hourly_df <- runCanopyStorageEuler(hourly_df, delTime)
+```
+
+Run for 5-minute
+
+```{r}
+delTime <- 5/1440 # (day)
+
+five_min_df <- runCanopyStorageEuler(five_min_df, delTime)
+```
+
+Plot the output for each time series
+
+```{r}
+#| label: "fig-q-3"
+#| layout-ncol: 3
+#| fig-width: 3
+#| fig-height: 3
+#| fig-subcap: 
+#| - "Daily"
+#| - "Hourly"
+#| - "5-min"
+#| fig-cap: Diagnostic variables used in the flux calculations
+
+ggplot(daily_df, aes(datetime, canopy_storage)) + 
+  geom_line() +
+  xlab('datetime') +
+  ylab('Canopy Storage (mm)') +
+  theme_bw()
+
+ggplot(hourly_df, aes(datetime, canopy_storage)) + 
+  geom_line() +
+  xlab('datetime') +
+  ylab('Canopy Storage (mm)') +
+  theme_bw()
+
+ggplot(five_min_df, aes(datetime, canopy_storage)) + 
+  geom_line() +
+  xlab('datetime') +
+  ylab('Canopy Storage (mm)') +
+  theme_bw()
+```
+
+## Temporally Integrate eq. 5
+
+Define a explicit euler based function to step through our various time series and calculate the change in storage in the unsaturated zone
+
+```{r}
+runUnsatStorageEuler <- function(df, delTime){
+  # set-up time loop
+  for (i in 1:(nrow(df)-1)) {
+    
+  # calculate the fluxes     
+  df$unsat_evap[i] <- 
+    unsatZoneEvap(unsatStorage = df$unsat_storage[i],
+                  potentialEvap = df$pet[i],
+                  wetFrac = wet_frac_const)
+  sat_frac_current <- 
+    satFrac(unsatStorage = df$unsat_storage[i])  
+  
+  df$overland_flow[i] <- 
+    overlandFlow(precipExcess = df$ppe[i], 
+                 satFrac = sat_frac_current)   
+  
+  df$percolation[i] <- 
+    percolation(unsatStorage = df$unsat_storage[i])
+  
+  # calculate the change in storage due to current fluxes
+   del_unsat_storage <- delUnsatStorage(df$ppe[i],
+                                          df$unsat_evap[i],
+                                          df$overland_flow[i],
+                                          df$percolation[i]
+                                          ) * delTime
+  # calculate the state of the next time step by adding the current change in storage to the state at the current time step, if the updated value is less than 0 set the state to 0 
+  df$unsat_storage[i+1] <- max(c(df$unsat_storage[i] + del_unsat_storage, 0))
+  }
+  
+  # return the time series output
+  return(df)
+}
+```
+
+Set initial unsaturated storage to zero and wet frac to 0 so this control volume is run in isolation.
+
+```{r}
+# update the initial conditions for the unsaturated zone
+
+daily_df$unsat_storage <- c(0, rep(NA, nrow(daily_df)-1))
+
+hourly_df$unsat_storage <- c(0, rep(NA, nrow(hourly_df)-1))
+
+five_min_df$unsat_storage <- c(0, rep(NA, nrow(five_min_df)-1))
+
+# use a constant value of zero for the wet fraction to isolate 
+# this control volume from the canopy
+
+wet_frac_const <- 0
+```
+
+Run for our daily set
+
+```{r}
+delTime <- 1 # day
+
+daily_df <- runUnsatStorageEuler(daily_df, delTime)
+```
+
+Run for hourly
+
+```{r}
+delTime <- 1/24 # (day)
+
+hourly_df <- runUnsatStorageEuler(hourly_df, delTime)
+```
+
+Run for 5-minute
+
+```{r}
+delTime <- 5/1440 # (day)
+
+five_min_df <- runUnsatStorageEuler(five_min_df, delTime)
+```
+
+Plot the output for each time series
+
+```{r}
+#| label: "fig-q-3"
+#| layout-ncol: 3
+#| fig-width: 3
+#| fig-height: 3
+#| fig-subcap: 
+#| - "Daily"
+#| - "Hourly"
+#| - "5-min"
+#| fig-cap: Diagnostic variables used in the flux calculations
+
+ggplot(daily_df, aes(datetime, unsat_storage)) + 
+  geom_line() +
+  xlab('datetime') +
+  ylab('Canopy Storage (mm)') +
+  theme_bw()
+
+ggplot(hourly_df, aes(datetime, unsat_storage)) + 
+  geom_line() +
+  xlab('datetime') +
+  ylab('Canopy Storage (mm)') +
+  theme_bw()
+
+ggplot(five_min_df, aes(datetime, unsat_storage)) + 
+  geom_line() +
+  xlab('datetime') +
+  ylab('Canopy Storage (mm)') +
+  theme_bw()
+```
+
+
