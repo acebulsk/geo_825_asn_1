@@ -1,0 +1,277 @@
+---
+title: "Assignment 01: Model Mechanics"
+author: Alex Cebulski
+date: today
+---
+
+```{r}
+#| include: false
+library(tidyverse)
+```
+
+
+# Compute the diagnostic variables used in the flux parameterizations
+
+## Define the Functions
+
+Define the global parameter set:
+
+```{r}
+nonLinearityWetFrac <- 2/3 # Non-linearity in the wetted fraction of the canopy (-)
+canopyInterceptionCapacity <- 3.00 # Maximum non-drainable interception storage (mm)
+canopyDrainageConstant <- 0.50 # Canopy drainage coefficient (day-1)
+fieldCapacity <- 25.00 # Field capacity (mm)
+unsatMaxStorage <- 100.00 # Maximum storage in the unsaturated zone (mm)
+nonLinearityVarSourceArea <- 0.25 # Non-linearity in the variable source area (-)
+maxPerc <- 500.00 # Maximum percolation rate (mm day-1)
+nonLinearityPerc <- 3.00 # Percolation non-linearity (-)
+runoffCoefSatZone <- 0.10 # Runoff coefficient for the saturated zone (day-1)
+```
+
+
+The wetted fraction of the canopy is defined as:
+
+$$
+F_{wet}(S_c) = \begin{cases}
+    \left(\frac{S_c}{S_{c,max}}\right)^\gamma,& \text{if } S_c\leq S_{c,max}\\
+    1,              & \text{otherwise}
+\end{cases}
+$$
+
+The corresponding function written in R is:
+
+```{r}
+wetFrac <- function(canopyInterception){
+  if (canopyInterception <= canopyInterceptionCapacity) {
+    wetFracOut <- (canopyInterception/canopyInterceptionCapacity)^nonLinearityWetFrac
+  }
+  else {
+    wetFracOut <- 1
+  }
+  return(wetFracOut)
+}
+```
+
+The saturated fraction is defined as:
+
+$$
+F_{sat} = \begin{cases}
+    1-\left(1-\frac{S_{uz}}{S_{uz,max}}\right)^\alpha,& \text{if } S_{uz}< S_{uz,max}\\
+    1,              & \text{otherwise}
+\end{cases}
+$$
+
+The corresponding function for the saturated fraction written in R is:
+
+```{r}
+satFrac <- function(unsatStorage){
+  if (unsatStorage < unsatMaxStorage) {
+    satFracOut <- 1-(1-(unsatStorage/unsatMaxStorage))^nonLinearityVarSourceArea
+  }
+  else {
+    satFracOut <- 1
+  }
+  return(satFracOut)
+}
+```
+
+## Plot the fluxes as a function of the state variables
+
+Example datasets
+
+```{r}
+wet_df <- data.frame(
+  canopy_storage = seq(0, 3, by = 0.1)
+)
+
+wet_df$wet_frac <- sapply(wet_df$canopy_storage, wetFrac)
+```
+
+```{r}
+sat_df <- data.frame(
+  unsat_zone_storage = seq(0, 100, by = 1)
+)
+
+sat_df$sat_frac <- sapply(sat_df$unsat_zone_storage, satFrac)
+```
+
+
+```{r}
+#| label: "fig-q-1"
+#| layout-ncol: 2
+#| fig-width: 4
+#| fig-height: 4
+#| fig-subcap: 
+#| - " "
+#| - " "
+#| fig-cap: Diagnostic variables used in the flux calculations
+
+ggplot(wet_df, aes(canopy_storage, wet_frac)) + 
+  geom_line() +
+  xlab('Canopy Storage (mm)') +
+  ylab('Wetted Fraction (-)') +
+  theme_bw()
+
+ggplot(sat_df, aes(unsat_zone_storage, sat_frac)) + 
+  geom_line() +
+  xlab('Unsaturated Zone Storage (mm)') +
+  ylab('Saturated Fraction (-)') +
+  theme_bw()
+```
+
+# Compute the Model Fluxes
+
+Our next step is to write functions to compute the model fluxes, i.e., eqs. (8) to (10) for the
+vegetation canopy, eqs. (13) to (15) for the unsaturated zone, and eq. (17) for the saturated
+zone.
+
+## Define the flux functions: 
+
+The function for equation 8, the flux of evaporation from interception storage, $E_c(S_c)$, is: 
+
+```{r}
+interceptEvap <- function(potentialEvap, wetFrac){
+  return(potentialEvap*wetFrac)
+}
+```
+
+The function for equation 9, the flux of canopy throughfall, $Q_t(S_c)$, is:
+
+```{r}
+canopyThroughfall <- function(precipInc, canopyInterception){
+  if (canopyInterception < canopyInterceptionCapacity) {
+    canopyThroughfall <- precipInc*(canopyInterception/canopyInterceptionCapacity)
+  }
+  else {
+    canopyThroughfall <- precipInc
+  }
+  return(canopyThroughfall)
+}
+```
+
+
+The function for equation 10, the flux of canopy drainage, $Q_c(S_c)$, is:
+
+```{r}
+canopyDrainage <- function(precipInc, canopyInterception){
+  if (canopyInterception < canopyInterceptionCapacity) {
+    canopyDrainageOut <- 0
+  }
+  else {
+    canopyDrainageOut <- canopyDrainageConstant * (canopyInterception - canopyInterceptionCapacity) 
+  }
+  return(canopyDrainageOut)
+}
+```
+
+The function for equation 13, the flux of evaporation from the unsaturated zone, $E_{uz}(S_{fc},S_{uz})$, is:
+
+```{r}
+unsatZoneEvap <- function(unsatStorage, potentialEvap, wetFrac){
+  if (unsatStorage < fieldCapacity) {
+    unsatZoneEvapOut <- potentialEvap*(unsatStorage/fieldCapacity)*(1-wetFrac)
+  }
+  else {
+    unsatZoneEvapOut <- potentialEvap*(1-wetFrac)
+  }
+  return(unsatZoneEvapOut)
+}
+```
+
+The function for equation 14, the flux of overland flow, $Q_o(S_c, S_{uz})$, is:
+
+```{r}
+overlandFlow <- function(canopyThroughfall, canopyDrainage, satFrac){
+  precipExcess <- canopyThroughfall + canopyDrainage
+  overlandFlowOut <- precipExcess*satFrac
+}
+```
+
+
+The function for equation 15, the flux of percolation, $Q_p(S_{uz})$, is:
+
+```{r}
+percolation <- function(unsatStorage){
+  if (unsatStorage < fieldCapacity) {
+    percolationOut <- 0
+  }
+  else {
+    percolationOut <- maxPerc * ((unsatStorage-fieldCapacity)/(unsatMaxStorage-fieldCapacity))^nonLinearityPerc
+  }
+  return(unsatZoneEvapOut)
+}
+```
+
+The function for equation 16, the saturated fraction, $F_{sat}$, is:
+
+```{r}
+satFrac <- function(unsatStorage){
+  if (unsatStorage < unsatMaxStorage) {
+    satFracOut <- 1 - (1-(unsatStorage/unsatMaxStorage)^nonLinearityVarSourceArea)
+  }
+  else {
+    satFracOut <- 1
+  }
+  return(unsatZoneEvapOut)
+}
+```
+
+The function for equation 17, the flux of baseflow in the saturated zone, $Q_b$, is:
+
+```{r}
+baseflow <- function(satStorage){
+  return(satStorage*maxPerc)
+}
+```
+
+The example forcing is 
+
+```{r}
+precip_inc <- 1 # mm day-1
+pot_et <- 1 # mm day-1
+```
+
+```{r}
+canopy_df <- data.frame(
+  canopy_storage = seq(0, 4, 0.1)
+)
+
+canopy_df$wet_frac <- sapply(canopy_df$canopy_storage, wetFrac)
+
+canopy_df$canopy_evap <- interceptEvap(potentialEvap = pot_et, wetFrac = canopy_df$wet_frac)
+
+canopy_df$canopy_throughfall <- mapply(canopyThroughfall, precip_inc, canopy_df$canopy_storage)
+
+canopy_df$canopy_drainage <- mapply(canopyDrainage, precip_inc, canopy_df$canopy_storage)
+
+
+```
+
+```{r}
+#| label: "fig-q-2"
+#| layout-ncol: 2
+#| fig-width: 4
+#| fig-height: 4
+#| fig-subcap: 
+#| - " "
+#| - " "
+#| fig-cap: Diagnostic variables used in the flux calculations
+
+ggplot(canopy_df, aes(canopy_storage, canopy_evap)) + 
+  geom_line() +
+  xlab('Canopy Storage (mm)') +
+  ylab('Canopy Evaporation (mm/day)') +
+  theme_bw()
+
+ggplot(canopy_df, aes(canopy_storage, canopy_throughfall)) + 
+  geom_line() +
+  xlab('Canopy Storage (mm)') +
+  ylab('Canopy Throughfall (mm/day)') +
+  theme_bw()
+
+ggplot(canopy_df, aes(canopy_storage, canopy_drainage)) + 
+  geom_line() +
+  xlab('Canopy Storage (mm)') +
+  ylab('Canopy Drainage (mm/day)') +
+  theme_bw()
+```
